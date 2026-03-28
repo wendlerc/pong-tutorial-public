@@ -21,8 +21,13 @@ from part1_flow_matching_basics import solutions
 device = solutions.device
 
 
+def _max_abs_diff(a, b):
+    return (a - b).abs().max().item()
+
+
 def test_velocity_mlp(VelocityMLP):
-    """Test VelocityMLP output shapes — c is always required."""
+    """Test VelocityMLP shapes and input sensitivity (architecture-agnostic)."""
+    t.manual_seed(42)
     model = VelocityMLP(data_dim=2, hidden_dim=64, class_dim=10, n_classes=2).to(device)
     x = t.randn(16, 2, device=device)
     ts = t.rand(16, device=device)
@@ -34,7 +39,33 @@ def test_velocity_mlp(VelocityMLP):
     c_uncond = t.zeros(16, dtype=t.long, device=device)
     out_uncond = model(x, ts, c_uncond)
     assert out_uncond.shape == (16, 2), f"Expected (16, 2), got {out_uncond.shape}"
-    print("  Exercise 1 (VelocityMLP): OK")
+
+    # --- Sensitivity: output must depend on each input (finite bumps, fixed seed above)
+    # Catches networks that ignore t, class, or a spatial coordinate.
+    xs = t.randn(8, 2, device=device)
+    tm = t.full((8,), 0.45, device=device)
+    c_moon0 = t.ones(8, dtype=t.long, device=device)
+    ref = model(xs, tm, c_moon0)
+    eps_x = 0.05
+    min_change = 1e-4
+
+    for i in range(2):
+        dx = t.zeros_like(xs)
+        dx[:, i] = eps_x
+        assert _max_abs_diff(ref, model(xs + dx, tm, c_moon0)) > min_change, (
+            f"Velocity should depend on x[:, {i}] (try wiring x_t into the network)"
+        )
+
+    assert _max_abs_diff(ref, model(xs, tm + 0.1, c_moon0)) > min_change, (
+        "Velocity should depend on timestep t (try wiring t into the network)"
+    )
+
+    c_moon1 = t.full((8,), 2, dtype=t.long, device=device)
+    assert _max_abs_diff(ref, model(xs, tm, c_moon1)) > min_change, (
+        "Velocity should depend on class label (try using the class embedding)"
+    )
+
+    print("  Exercise 1 (VelocityMLP): OK — shapes + input sensitivity")
 
 
 def test_train(train_fn, VelocityMLP):
