@@ -1,0 +1,33 @@
+[project]
+name = "pong-tutorial"
+version = "0.1.0"
+description = "ARENA-style tutorial on video rectified flow matching world models"
+readme = "README.md"
+requires-python = ">=3.10,<3.14"
+dependencies = [
+    "torch>=2.0",
+    "torchvision",
+    "numpy",
+    "matplotlib",
+    "einops",
+    "huggingface_hub",
+    "muon-optimizer @ git+https://github.com/KellerJordan/Muon",
+    "scikit-learn",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "ipykernel",
+    "jupyter",
+]
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["exercises"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

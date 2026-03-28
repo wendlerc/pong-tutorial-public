@@ -1,0 +1,724 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Exercise 4: KV Caching for Frame-Autoregressive Inference</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      line-height: 1.6;
+      color: #333;
+      max-width: 800px;
+      margin: 0 auto;
+      padding: 2em;
+    }
+    pre {
+      background: #f6f8fa;
+      padding: 1em;
+      border-radius: 5px;
+      overflow-x: auto;
+      margin: 1.5em 0;
+    }
+    code {
+      font-family: SFMono-Regular, Consolas, Liberation Mono, Menlo, monospace;
+      background: #f6f8fa;
+      padding: 0.2em 0.4em;
+      border-radius: 3px;
+      font-size: 85%;
+    }
+    pre code { background: none; padding: 0; font-size: 92%; }
+    h1, h2, h3, h4 {
+      margin-top: 1.5em;
+      margin-bottom: 0.5em;
+      font-weight: 600;
+      line-height: 1.25;
+    }
+    h1 { font-size: 2em; border-bottom: 1px solid #eaecef; padding-bottom: 0.3em; }
+    h2 { font-size: 1.5em; border-bottom: 1px solid #eaecef; padding-bottom: 0.3em; }
+    p { margin: 1em 0; }
+    a { color: #0366d6; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    img { max-width: 100%; }
+    blockquote {
+      margin: 0; padding: 0 1em; color: #6a737d;
+      border-left: 0.25em solid #dfe2e5;
+    }
+    ul, ol { padding-left: 2em; }
+    table { border-collapse: collapse; width: 100%; margin: 1em 0; }
+    table, th, td { border: 1px solid #dfe2e5; }
+    th, td { padding: 6px 13px; text-align: left; }
+    tr:nth-child(even) { background-color: #f6f8fa; }
+    .exercise {
+      border: 2px solid #0366d6;
+      border-radius: 8px;
+      padding: 1.2em;
+      margin: 1.5em 0;
+      background: #f8fbff;
+    }
+    .exercise h3 { margin-top: 0; color: #0366d6; }
+    .exercise-meta {
+      font-size: 0.85em;
+      color: #586069;
+      margin-bottom: 0.8em;
+    }
+    details {
+      margin: 0.8em 0;
+      border: 1px solid #e1e4e8;
+      border-radius: 5px;
+      background: #fff;
+    }
+    details summary {
+      padding: 0.5em 1em;
+      cursor: pointer;
+      font-weight: 600;
+      color: #0366d6;
+      background: #f1f8ff;
+      border-radius: 5px;
+    }
+    details[open] summary {
+      border-bottom: 1px solid #e1e4e8;
+      border-radius: 5px 5px 0 0;
+    }
+    details > *:not(summary) { padding: 0 1em; }
+    .learning-obj {
+      background: #f0fff4;
+      border-left: 4px solid #28a745;
+      padding: 0.8em 1em;
+      margin: 1em 0;
+      border-radius: 0 5px 5px 0;
+    }
+    .note {
+      background: #fffbdd;
+      border-left: 4px solid #f9c513;
+      padding: 0.8em 1em;
+      margin: 1em 0;
+      border-radius: 0 5px 5px 0;
+    }
+    .nav-link {
+      display: inline-block;
+      margin: 0.5em 0;
+      padding: 0.4em 0.8em;
+      background: #f1f8ff;
+      border-radius: 5px;
+      border: 1px solid #0366d6;
+    }
+  </style>
+  <script type="text/javascript" id="MathJax-script" async
+    src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js">
+  </script>
+</head>
+<body>
+
+<p><a href="../Home.html">&larr; Back to reading list</a></p>
+
+<h1>Exercise 4: KV Caching for Frame-Autoregressive Inference</h1>
+
+<div class="learning-obj">
+<strong>Learning objectives:</strong>
+<ul>
+  <li>Understand why naive frame-autoregressive generation is slow and how KV caching helps</li>
+  <li>Adapt the KV-Cache from Exercise 1 to work with the video DiT from Exercise 3</li>
+  <li>Handle the subtlety that the <em>new frame</em> is denoised over multiple Euler steps (K,V for the new frame change each step, but K,V for previous frames are fixed)</li>
+  <li>Benchmark the speedup from KV caching</li>
+</ul>
+</div>
+
+<p><strong>Prerequisites:</strong> <a href="04_far_kv_cache.html">Exercise 1</a> (KV-Cache basics) and <a href="03_far_pong.html">Exercise 3</a> (frame-autoregressive Pong model). Reference implementation: <a href="https://github.com/wendlerc/toy-wm/">wendlerc/toy-wm</a>.</p>
+
+<h2>Background: Why Cache for Video?</h2>
+
+<p>Recall from Exercise 3 that video sampling works like this:</p>
+<ol>
+  <li>For each new frame, run \(N\) denoising steps (e.g. 30 Euler steps)</li>
+  <li>At each denoising step, the model processes <strong>all previous frames + the current noisy frame</strong></li>
+  <li>After denoising, the clean frame becomes context for the next frame</li>
+</ol>
+
+<p>Without caching, generating frame \(f\) requires processing \(f \times P\) tokens at each denoising step (where \(P\) = patches per frame). For a 100-frame video with 36 patches per frame, the last frame requires processing 3600 tokens &times; 30 denoising steps. The total compute across all frames is enormous.</p>
+
+<p>With KV caching, we only process the <strong>new frame's patches</strong> (\(P\) tokens) at each denoising step, retrieving cached K, V for all previous frames. This gives a roughly \(\sim f\times\) speedup for frame \(f\).</p>
+
+<h2>The Subtlety: What Can Be Cached?</h2>
+
+<p>Unlike standard LLM generation (Exercise 1), video denoising has a subtlety:</p>
+
+<ul>
+  <li><strong>Previous frames</strong> (fully denoised, \(t=0\)): their K, V are fixed. Cache them once when each frame is finalized.</li>
+  <li><strong>Current frame</strong> (being denoised): its K, V change at every Euler step as the frame gets cleaner. These should <strong>not</strong> be cached across denoising steps.</li>
+</ul>
+
+<p>So the strategy is:</p>
+<ol>
+  <li>When a frame is fully denoised, run one forward pass for just that frame's tokens and cache their K, V.</li>
+  <li>During denoising of the next frame, use the cache for all previous frames and compute fresh K, V for the current frame only.</li>
+</ol>
+
+<h2>Setup</h2>
+
+<p>Start from your Exercise 3 code. You'll need all the model components (<code>RMSNorm</code>, <code>MLP</code>, <code>VideoPatch</code>, <code>VideoUnPatch</code>, etc.) and a trained <code>CausalDiT</code>.</p>
+
+<pre><code class="language-python">import torch
+import torch as t
+from torch import nn
+import time
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+# Load your model components from Exercise 3
+</code></pre>
+
+<!-- ==================== EXERCISE 1 ==================== -->
+<div class="exercise">
+<h3>Exercise 1 &mdash; Adapt KVCache for Video</h3>
+<p class="exercise-meta">Difficulty: &#x1f534;&#x1f534;&#x2b55;&#x2b55;&#x2b55; &nbsp;|&nbsp; Importance: &#x1f535;&#x1f535;&#x1f535;&#x1f535;&#x2b55; &nbsp;|&nbsp; ~10 min</p>
+
+<p>Reuse the <code>KVCache</code> from Exercise 1. Add a method to <strong>append</strong> finalized K,V (for a denoised frame) without returning concatenated results, and a method to <strong>get</strong> the cached K,V for use during denoising.</p>
+
+<pre><code class="language-python">class VideoKVCache:
+    """KV Cache for frame-autoregressive video generation.
+
+    Stores K, V for all finalized (fully denoised) frames.
+    During denoising of a new frame, cached K,V are concatenated
+    with the new frame's K,V.
+    """
+    def __init__(self, n_layers):
+        # YOUR CODE HERE
+        pass
+
+    def append(self, layer_idx, keys, values):
+        """Append finalized K,V for a newly denoised frame.
+
+        Args:
+            layer_idx: which layer
+            keys: (B, n_head, P, d_head) - keys for one frame's patches
+            values: (B, n_head, P, d_head)
+        """
+        # YOUR CODE HERE
+        pass
+
+    def get_cached_kv(self, layer_idx):
+        """Get all cached K,V for use in attention.
+
+        Returns:
+            (cached_keys, cached_values) or (None, None) if empty
+        """
+        # YOUR CODE HERE
+        pass
+
+    def get_and_extend(self, layer_idx, new_keys, new_values):
+        """Get cached K,V concatenated with new K,V.
+
+        Used during denoising: cached K,V for previous frames +
+        new K,V for the frame being denoised.
+
+        Returns:
+            (all_keys, all_values)
+        """
+        # YOUR CODE HERE
+        pass
+
+    @property
+    def cached_seq_len(self):
+        """Total number of cached tokens (across all finalized frames)."""
+        # YOUR CODE HERE
+        pass
+</code></pre>
+
+<details>
+<summary>Solution</summary>
+<pre><code class="language-python">class VideoKVCache:
+    def __init__(self, n_layers):
+        self.cache = [None] * n_layers
+
+    def append(self, layer_idx, keys, values):
+        if self.cache[layer_idx] is None:
+            self.cache[layer_idx] = (keys, values)
+        else:
+            prev_k, prev_v = self.cache[layer_idx]
+            self.cache[layer_idx] = (
+                t.cat([prev_k, keys], dim=2),
+                t.cat([prev_v, values], dim=2),
+            )
+
+    def get_cached_kv(self, layer_idx):
+        if self.cache[layer_idx] is None:
+            return None, None
+        return self.cache[layer_idx]
+
+    def get_and_extend(self, layer_idx, new_keys, new_values):
+        cached_k, cached_v = self.get_cached_kv(layer_idx)
+        if cached_k is None:
+            return new_keys, new_values
+        return (
+            t.cat([cached_k, new_keys], dim=2),
+            t.cat([cached_v, new_values], dim=2),
+        )
+
+    @property
+    def cached_seq_len(self):
+        if self.cache[0] is None:
+            return 0
+        return self.cache[0][0].shape[2]
+</code></pre>
+</details>
+</div>
+
+<!-- ==================== EXERCISE 2 ==================== -->
+<div class="exercise">
+<h3>Exercise 2 &mdash; Modify Attention for Cached Video Inference</h3>
+<p class="exercise-meta">Difficulty: &#x1f534;&#x1f534;&#x1f534;&#x1f534;&#x2b55; &nbsp;|&nbsp; Importance: &#x1f535;&#x1f535;&#x1f535;&#x1f535;&#x1f535; &nbsp;|&nbsp; ~25 min</p>
+
+<p>Modify the video attention to use the KV cache. When a cache is provided:</p>
+<ol>
+  <li>Only the <em>new</em> tokens' Q, K, V are computed from the input</li>
+  <li>K, V are concatenated with cached K, V from previous frames</li>
+  <li>Q attends to all K's (cached + new) &mdash; no mask needed since all cached tokens are from earlier frames (already causally valid)</li>
+</ol>
+
+<pre><code class="language-python">class CachedVideoAttention(nn.Module):
+    def __init__(self, d=64, n_head=4):
+        super().__init__()
+        self.n_head = n_head
+        self.d = d
+        self.d_head = d // n_head
+        self.QKV = nn.Linear(d, 3 * d, bias=False)
+        self.O = nn.Linear(d, d, bias=False)
+        self.normq = RMSNorm(self.d_head)
+        self.normk = RMSNorm(self.d_head)
+
+    def forward(self, x, mask=None, kv_cache=None, layer_idx=None, cache_mode=None):
+        """
+        Args:
+            x: (B, S, d) input tokens
+            mask: optional attention mask (S_q, S_k) for non-cached mode
+            kv_cache: optional VideoKVCache
+            layer_idx: layer index for cache
+            cache_mode: None (no cache), "denoise" (denoising with cache),
+                       or "finalize" (store finalized frame to cache)
+        """
+        b, s, d = x.shape
+        q, k, v = self.QKV(x).chunk(3, dim=-1)
+        q = q.reshape(b, s, self.n_head, self.d_head)
+        k = k.reshape(b, s, self.n_head, self.d_head)
+        v = v.reshape(b, s, self.n_head, self.d_head)
+        q = self.normq(q)
+        k = self.normk(k)
+
+        # Transpose to (b, n_head, s, d_head)
+        q = q.permute(0, 2, 1, 3)
+        k = k.permute(0, 2, 1, 3)
+        v = v.permute(0, 2, 1, 3)
+
+        if kv_cache is not None and cache_mode == "finalize":
+            # YOUR CODE HERE
+            # Store this frame's K,V in the cache, then return
+            # attention output normally (attending to all cached + current)
+            pass
+
+        if kv_cache is not None and cache_mode == "denoise":
+            # YOUR CODE HERE
+            # Concatenate cached K,V with current K,V
+            # No mask needed (new tokens attend to all)
+            pass
+
+        # Default: no cache, use mask if provided
+        # YOUR CODE HERE
+        pass
+</code></pre>
+
+<details>
+<summary>Hint</summary>
+<p>For <code>"finalize"</code> mode: append K, V to the cache, then compute attention using all cached K, V (including the just-appended ones). For <code>"denoise"</code> mode: use <code>get_and_extend</code> to get cached + new K, V, but do NOT append to the cache (since the frame is still being denoised and will change).</p>
+</details>
+
+<details>
+<summary>Solution</summary>
+<pre><code class="language-python">class CachedVideoAttention(nn.Module):
+    def __init__(self, d=64, n_head=4):
+        super().__init__()
+        self.n_head = n_head
+        self.d = d
+        self.d_head = d // n_head
+        self.QKV = nn.Linear(d, 3 * d, bias=False)
+        self.O = nn.Linear(d, d, bias=False)
+        self.normq = RMSNorm(self.d_head)
+        self.normk = RMSNorm(self.d_head)
+
+    def forward(self, x, mask=None, kv_cache=None, layer_idx=None, cache_mode=None):
+        b, s, d = x.shape
+        q, k, v = self.QKV(x).chunk(3, dim=-1)
+        q = q.reshape(b, s, self.n_head, self.d_head)
+        k = k.reshape(b, s, self.n_head, self.d_head)
+        v = v.reshape(b, s, self.n_head, self.d_head)
+        q = self.normq(q)
+        k = self.normk(k)
+        q = q.permute(0, 2, 1, 3)
+        k = k.permute(0, 2, 1, 3)
+        v = v.permute(0, 2, 1, 3)
+
+        if kv_cache is not None and cache_mode == "finalize":
+            # Store in cache and attend to everything
+            kv_cache.append(layer_idx, k, v)
+            k_full, v_full = kv_cache.get_cached_kv(layer_idx)
+            attn = q @ k_full.transpose(-2, -1)
+            attn = attn.softmax(dim=-1)
+            out = attn @ v_full
+
+        elif kv_cache is not None and cache_mode == "denoise":
+            # Extend with cache but don't store
+            k_full, v_full = kv_cache.get_and_extend(layer_idx, k, v)
+            attn = q @ k_full.transpose(-2, -1)
+            attn = attn.softmax(dim=-1)
+            out = attn @ v_full
+
+        else:
+            # Standard attention with optional mask
+            attn = q @ k.transpose(-2, -1)
+            if mask is not None:
+                attn = attn.masked_fill(mask[None, None, :, :], float('-inf'))
+            attn = attn.softmax(dim=-1)
+            out = attn @ v
+
+        out = out.permute(0, 2, 1, 3).reshape(b, s, self.d)
+        return self.O(out)
+</code></pre>
+</details>
+</div>
+
+<!-- ==================== EXERCISE 3 ==================== -->
+<div class="exercise">
+<h3>Exercise 3 &mdash; Build Cached CausalDiT</h3>
+<p class="exercise-meta">Difficulty: &#x1f534;&#x1f534;&#x1f534;&#x1f534;&#x2b55; &nbsp;|&nbsp; Importance: &#x1f535;&#x1f535;&#x1f535;&#x1f535;&#x1f535; &nbsp;|&nbsp; ~25 min</p>
+
+<p>Modify the <code>CausalDiT</code> to support two modes of forward pass:</p>
+<ol>
+  <li><strong>Normal mode</strong> (no cache): processes full video as before (for training and non-cached inference)</li>
+  <li><strong>Cached mode</strong>: processes only one frame's worth of tokens, using the cache for previous frames</li>
+</ol>
+
+<pre><code class="language-python">class CachedCausalDiT(nn.Module):
+    def __init__(self, h=24, w=24, n_actions=4, in_channels=3,
+                 patch_size=4, n_blocks=8, d=64, n_head=4, exp=2, T=1000):
+        super().__init__()
+        # Same as CausalDiT but use CachedVideoAttention in blocks
+        # YOUR CODE HERE
+        pass
+
+    def forward(self, x, actions, ts, kv_cache=None, cache_mode=None):
+        """
+        Args:
+            x: (B, T_frames, C, H, W) video frames
+            actions: (B, T_frames) actions
+            ts: (B, T_frames) timesteps
+            kv_cache: optional VideoKVCache
+            cache_mode: "denoise" or "finalize" or None
+        """
+        # YOUR CODE HERE
+        # When cache_mode is "denoise" or "finalize":
+        #   - x should contain only the new frame(s)
+        #   - Positional embedding uses pe (no need to tile for multiple frames)
+        #   - conditioning is computed for new frame(s) only
+        #   - Pass cache_mode and kv_cache through to attention
+        # When cache_mode is None:
+        #   - Standard full forward pass as before
+        pass
+</code></pre>
+
+<details>
+<summary>Solution</summary>
+<pre><code class="language-python">class CachedCausalDiTBlock(nn.Module):
+    def __init__(self, d=64, n_head=4, exp=2):
+        super().__init__()
+        self.norm1 = RMSNorm(d)
+        self.attn = CachedVideoAttention(d, n_head)
+        self.norm2 = RMSNorm(d)
+        self.mlp = MLP(d, exp)
+        self.modulate = nn.Linear(d, 6 * d)
+
+    def forward(self, x, c, mask=None, kv_cache=None, layer_idx=None, cache_mode=None):
+        scale1, bias1, gate1, scale2, bias2, gate2 = self.modulate(c).chunk(6, dim=-1)
+        residual = x
+        x = self.norm1(x) * (1 + scale1) + bias1
+        x = self.attn(x, mask=mask, kv_cache=kv_cache,
+                      layer_idx=layer_idx, cache_mode=cache_mode) * gate1
+        x = residual + x
+        residual = x
+        x = self.norm2(x) * (1 + scale2) + bias2
+        x = self.mlp(x) * gate2
+        x = residual + x
+        return x
+
+
+class CachedCausalDiT(nn.Module):
+    def __init__(self, h=24, w=24, n_actions=4, in_channels=3,
+                 patch_size=4, n_blocks=8, d=64, n_head=4, exp=2, T=1000):
+        super().__init__()
+        self.T = T
+        self.n_blocks = n_blocks
+        self.patches_per_frame = (h // patch_size) * (w // patch_size)
+        self.patch = VideoPatch(patch_size, in_channels, d)
+        self.unpatch = VideoUnPatch(patch_size, d, in_channels, height=h, width=w)
+        self.pe = nn.Parameter(t.randn(1, self.patches_per_frame, d) * d ** -0.5)
+        self.te = NumEmbedding(T, d)
+        self.ae = nn.Embedding(n_actions, d)
+        self.act = nn.SiLU()
+        self.blocks = nn.ModuleList(
+            [CachedCausalDiTBlock(d, n_head, exp) for _ in range(n_blocks)]
+        )
+        self.norm = RMSNorm(d)
+        self.mod_final = nn.Linear(d, 2 * d)
+
+    def forward(self, x, actions, ts, kv_cache=None, cache_mode=None):
+        B, T_frames, C, H, W = x.shape
+        P = self.patches_per_frame
+
+        # Patchify
+        tokens = self.patch(x)  # (B, T_frames*P, d)
+
+        # Positional embedding
+        pe = self.pe.repeat(1, T_frames, 1)
+        tokens = tokens + pe
+
+        # Per-frame conditioning
+        ts_int = t.minimum((ts * self.T).long(), t.tensor(self.T - 1, device=ts.device))
+        cond = self.act(self.te(ts_int) + self.ae(actions))
+        cond = cond.repeat_interleave(P, dim=1)
+
+        # Mask (only needed for uncached multi-frame forward)
+        mask = None
+        if cache_mode is None and T_frames > 1:
+            mask = make_block_causal_mask(T_frames, P, device=x.device)
+
+        # DiT blocks
+        for i, block in enumerate(self.blocks):
+            tokens = block(tokens, cond, mask=mask, kv_cache=kv_cache,
+                          layer_idx=i, cache_mode=cache_mode)
+
+        # Final modulated norm
+        scale, bias = self.mod_final(cond).chunk(2, dim=-1)
+        tokens = self.norm(tokens) * (1 + scale) + bias
+
+        # Unpatch
+        return self.unpatch(tokens, n_frames=T_frames)
+
+    @property
+    def device(self):
+        return self.pe.device
+</code></pre>
+</details>
+</div>
+
+<!-- ==================== EXERCISE 4 ==================== -->
+<div class="exercise">
+<h3>Exercise 4 &mdash; Implement Cached Video Sampling</h3>
+<p class="exercise-meta">Difficulty: &#x1f534;&#x1f534;&#x1f534;&#x1f534;&#x1f534; &nbsp;|&nbsp; Importance: &#x1f535;&#x1f535;&#x1f535;&#x1f535;&#x1f535; &nbsp;|&nbsp; ~30 min</p>
+
+<p>This is the capstone exercise. Implement frame-autoregressive sampling with KV caching. The algorithm is:</p>
+
+<ol>
+  <li><strong>Finalize the first frame:</strong> run forward with <code>cache_mode="finalize"</code> to store K,V for the context frame</li>
+  <li><strong>For each new frame:</strong>
+    <ol type="a">
+      <li>Initialize the new frame as noise</li>
+      <li>Run \(N\) denoising steps, each time forwarding only the new frame's tokens with <code>cache_mode="denoise"</code></li>
+      <li>After denoising is complete, run one final forward with <code>cache_mode="finalize"</code> to store the clean frame's K,V in the cache</li>
+    </ol>
+  </li>
+</ol>
+
+<pre><code class="language-python">@t.no_grad()
+def sample_video_cached(model, first_frame, actions, n_denoise_steps=30, cfg=0):
+    """Generate video with KV-cached frame-autoregressive sampling.
+
+    Args:
+        model: CachedCausalDiT
+        first_frame: (B, 1, C, H, W) context frame
+        actions: (B, total_frames) action sequence
+        n_denoise_steps: Euler steps per frame
+        cfg: classifier-free guidance strength
+
+    Returns:
+        (B, total_frames, C, H, W) generated video
+    """
+    B = first_frame.shape[0]
+    total_frames = actions.shape[1]
+    C, H, W = first_frame.shape[2:]
+
+    # YOUR CODE HERE
+    # 1. Create two KV caches (one for conditional, one for unconditional if cfg > 0)
+    # 2. Finalize the first frame
+    # 3. For each subsequent frame:
+    #    a. Initialize noise
+    #    b. Denoise with Euler steps (using cache)
+    #    c. Finalize the denoised frame (add to cache)
+    # 4. Return the full video
+    pass
+</code></pre>
+
+<details>
+<summary>Hint 1</summary>
+<p>During denoising, the input to the model is a single frame: <code>x</code> has shape <code>(B, 1, C, H, W)</code>. The timestep and action also have shape <code>(B, 1)</code>. The cache handles retrieving K,V for all previous frames.</p>
+</details>
+
+<details>
+<summary>Hint 2</summary>
+<p>For CFG, you need <em>two</em> caches: one that stores K,V computed with actual actions (conditional), and one with zeroed actions (unconditional). You run two forward passes per step, just like in the uncached version.</p>
+</details>
+
+<details>
+<summary>Solution</summary>
+<pre><code class="language-python">@t.no_grad()
+def sample_video_cached(model, first_frame, actions, n_denoise_steps=30, cfg=0):
+    B = first_frame.shape[0]
+    total_frames = actions.shape[1]
+    C, H, W = first_frame.shape[2:]
+
+    cache_cond = VideoKVCache(model.n_blocks)
+    cache_uncond = VideoKVCache(model.n_blocks) if cfg > 0 else None
+
+    video = first_frame.clone()
+
+    # Finalize the first frame
+    ts_zero = t.zeros(B, 1, device=first_frame.device)
+    act_first = actions[:, :1]
+    model(first_frame, act_first, ts_zero, kv_cache=cache_cond, cache_mode="finalize")
+    if cfg > 0:
+        model(first_frame, act_first * 0, ts_zero, kv_cache=cache_uncond, cache_mode="finalize")
+
+    for frame_idx in range(1, total_frames):
+        z = t.randn(B, 1, C, H, W, device=first_frame.device, dtype=first_frame.dtype)
+
+        denoise_ts = t.linspace(1, 0, n_denoise_steps + 1, device=first_frame.device)
+        denoise_ts = 3 * denoise_ts / (2 * denoise_ts + 1)
+
+        act_frame = actions[:, frame_idx:frame_idx + 1]  # (B, 1)
+
+        for step_idx in range(n_denoise_steps):
+            ts_frame = denoise_ts[step_idx] * t.ones(B, 1, device=first_frame.device)
+
+            v_pred = model(z, act_frame, ts_frame,
+                          kv_cache=cache_cond, cache_mode="denoise")[:, :1]
+
+            if cfg > 0:
+                v_uncond = model(z, act_frame * 0, ts_frame,
+                               kv_cache=cache_uncond, cache_mode="denoise")[:, :1]
+                v_pred = v_uncond + cfg * (v_pred - v_uncond)
+
+            dt = denoise_ts[step_idx] - denoise_ts[step_idx + 1]
+            z = z + dt * v_pred
+
+        # Finalize: store clean frame's K,V in cache
+        model(z, act_frame, ts_zero, kv_cache=cache_cond, cache_mode="finalize")
+        if cfg > 0:
+            model(z, act_frame * 0, ts_zero, kv_cache=cache_uncond, cache_mode="finalize")
+
+        video = t.cat([video, z], dim=1)
+
+    return video
+</code></pre>
+</details>
+</div>
+
+<!-- ==================== EXERCISE 5 ==================== -->
+<div class="exercise">
+<h3>Exercise 5 &mdash; Verify Correctness and Benchmark</h3>
+<p class="exercise-meta">Difficulty: &#x1f534;&#x1f534;&#x1f534;&#x2b55;&#x2b55; &nbsp;|&nbsp; Importance: &#x1f535;&#x1f535;&#x1f535;&#x1f535;&#x2b55; &nbsp;|&nbsp; ~15 min</p>
+
+<p>Verify that the cached and uncached versions produce the same output (when using the same noise), then benchmark the speedup.</p>
+
+<pre><code class="language-python"># Step 1: Correctness check
+# YOUR CODE HERE
+# - Set a fixed random seed
+# - Generate a short video (e.g. 5 frames) with sample_video (uncached)
+# - Reset the seed to the same value
+# - Generate the same video with sample_video_cached
+# - Assert the outputs match (t.allclose with reasonable tolerance)
+
+# Step 2: Benchmark
+# YOUR CODE HERE
+# - Time both methods for generating 10, 20, 50 frames
+# - Plot the speedup as a function of video length
+</code></pre>
+
+<details>
+<summary>Solution</summary>
+<pre><code class="language-python"># Correctness check
+model.eval()
+frames, actions_seq = dataset[0]
+first_frame = frames[:1].unsqueeze(0).to(device)
+act = actions_seq[:8].unsqueeze(0).to(device)
+
+# Need to ensure same noise - set seed before each
+t.manual_seed(42)
+video_naive = sample_video(model, first_frame, act, n_denoise_steps=10, cfg=0)
+
+t.manual_seed(42)
+video_cached = sample_video_cached(model, first_frame, act, n_denoise_steps=10, cfg=0)
+
+print(f"Max difference: {(video_naive - video_cached).abs().max().item():.6f}")
+assert t.allclose(video_naive, video_cached, atol=1e-4), "Outputs don't match!"
+print("Cached and uncached outputs match!")
+
+# Benchmark
+import time
+
+results = {}
+for n_frames in [5, 10, 20]:
+    act = t.ones(1, n_frames, dtype=t.long, device=device)
+
+    if device == "cuda":
+        t.cuda.synchronize()
+    start = time.time()
+    sample_video(model, first_frame, act, n_denoise_steps=10, cfg=0)
+    if device == "cuda":
+        t.cuda.synchronize()
+    time_naive = time.time() - start
+
+    if device == "cuda":
+        t.cuda.synchronize()
+    start = time.time()
+    sample_video_cached(model, first_frame, act, n_denoise_steps=10, cfg=0)
+    if device == "cuda":
+        t.cuda.synchronize()
+    time_cached = time.time() - start
+
+    speedup = time_naive / time_cached
+    results[n_frames] = speedup
+    print(f"{n_frames} frames: naive={time_naive:.2f}s, cached={time_cached:.2f}s, speedup={speedup:.1f}x")
+
+# Plot
+plt.figure(figsize=(8, 4))
+plt.bar([str(k) for k in results], results.values())
+plt.xlabel("Number of frames")
+plt.ylabel("Speedup factor (x)")
+plt.title("KV Cache Speedup for Frame-Autoregressive Generation")
+plt.tight_layout()
+plt.show()
+</code></pre>
+</details>
+</div>
+
+<div class="note">
+<strong>Expected results:</strong> You should see speedups that grow roughly linearly with the number of frames. For 20 frames, expect a ~5&ndash;10x speedup. For longer sequences (50+ frames), the speedup becomes even more dramatic. This is because without caching, each denoising step of frame \(f\) processes \(f \times P\) tokens, while with caching it always processes just \(P\) tokens.
+</div>
+
+<h2>Bonus: Sliding Window Cache</h2>
+
+<p>For very long videos, even the KV cache grows large. A <strong>sliding window</strong> approach keeps only the most recent \(W\) frames in the cache, discarding older ones. This trades off long-range temporal coherence for bounded memory usage. Check the <a href="https://github.com/wendlerc/toy-wm/">toy-wm reference implementation</a> for an example.</p>
+
+<h2>Summary</h2>
+
+<p>Congratulations! You've built a complete pipeline from scratch:</p>
+<ol>
+  <li><strong>Exercise 1:</strong> KV-Caching fundamentals for autoregressive transformers</li>
+  <li><strong>Exercise 2:</strong> Flow matching for image generation (patchify, DiT, training, sampling, CFG)</li>
+  <li><strong>Exercise 3:</strong> Frame-autoregressive video generation (temporal extension, causal attention, diffusion forcing)</li>
+  <li><strong>Exercise 4:</strong> KV-caching for efficient video inference</li>
+</ol>
+
+<p>These are the core building blocks behind modern frame-autoregressive video generation and world models. The same principles scale to much larger models, higher resolutions, and more complex environments.</p>
+
+<p><a class="nav-link" href="03_far_pong.html">&larr; Previous: Exercise 3</a> &nbsp; <a class="nav-link" href="../Home.html">Back to reading list</a></p>
+
+</body>
+</html>

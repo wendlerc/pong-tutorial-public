@@ -1,0 +1,961 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Exercise 2: Flow Matching on MNIST</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      line-height: 1.6;
+      color: #333;
+      max-width: 800px;
+      margin: 0 auto;
+      padding: 2em;
+    }
+    pre {
+      background: #f6f8fa;
+      padding: 1em;
+      border-radius: 5px;
+      overflow-x: auto;
+      margin: 1.5em 0;
+    }
+    code {
+      font-family: SFMono-Regular, Consolas, Liberation Mono, Menlo, monospace;
+      background: #f6f8fa;
+      padding: 0.2em 0.4em;
+      border-radius: 3px;
+      font-size: 85%;
+    }
+    pre code { background: none; padding: 0; font-size: 92%; }
+    h1, h2, h3, h4 {
+      margin-top: 1.5em;
+      margin-bottom: 0.5em;
+      font-weight: 600;
+      line-height: 1.25;
+    }
+    h1 { font-size: 2em; border-bottom: 1px solid #eaecef; padding-bottom: 0.3em; }
+    h2 { font-size: 1.5em; border-bottom: 1px solid #eaecef; padding-bottom: 0.3em; }
+    p { margin: 1em 0; }
+    a { color: #0366d6; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    img { max-width: 100%; }
+    blockquote {
+      margin: 0; padding: 0 1em; color: #6a737d;
+      border-left: 0.25em solid #dfe2e5;
+    }
+    ul, ol { padding-left: 2em; }
+    table { border-collapse: collapse; width: 100%; margin: 1em 0; }
+    table, th, td { border: 1px solid #dfe2e5; }
+    th, td { padding: 6px 13px; text-align: left; }
+    tr:nth-child(even) { background-color: #f6f8fa; }
+    .exercise {
+      border: 2px solid #0366d6;
+      border-radius: 8px;
+      padding: 1.2em;
+      margin: 1.5em 0;
+      background: #f8fbff;
+    }
+    .exercise h3 { margin-top: 0; color: #0366d6; }
+    .exercise-meta {
+      font-size: 0.85em;
+      color: #586069;
+      margin-bottom: 0.8em;
+    }
+    details {
+      margin: 0.8em 0;
+      border: 1px solid #e1e4e8;
+      border-radius: 5px;
+      background: #fff;
+    }
+    details summary {
+      padding: 0.5em 1em;
+      cursor: pointer;
+      font-weight: 600;
+      color: #0366d6;
+      background: #f1f8ff;
+      border-radius: 5px;
+    }
+    details[open] summary {
+      border-bottom: 1px solid #e1e4e8;
+      border-radius: 5px 5px 0 0;
+    }
+    details > *:not(summary) { padding: 0 1em; }
+    .learning-obj {
+      background: #f0fff4;
+      border-left: 4px solid #28a745;
+      padding: 0.8em 1em;
+      margin: 1em 0;
+      border-radius: 0 5px 5px 0;
+    }
+    .note {
+      background: #fffbdd;
+      border-left: 4px solid #f9c513;
+      padding: 0.8em 1em;
+      margin: 1em 0;
+      border-radius: 0 5px 5px 0;
+    }
+    .nav-link {
+      display: inline-block;
+      margin: 0.5em 0;
+      padding: 0.4em 0.8em;
+      background: #f1f8ff;
+      border-radius: 5px;
+      border: 1px solid #0366d6;
+    }
+  </style>
+  <script type="text/javascript" id="MathJax-script" async
+    src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js">
+  </script>
+</head>
+<body>
+
+<p><a href="../Home.html">&larr; Back to reading list</a></p>
+
+<h1>Exercise 2: Flow Matching on MNIST</h1>
+
+<div class="learning-obj">
+<strong>Learning objectives:</strong>
+<ul>
+  <li>Implement patchify/unpatchify to convert images into token sequences</li>
+  <li>Build a Diffusion Transformer (DiT) with adaptive layer norm conditioning</li>
+  <li>Understand and implement the rectified flow matching objective</li>
+  <li>Train a model to generate MNIST digits from noise</li>
+  <li>Add class conditioning and classifier-free guidance (CFG)</li>
+</ul>
+</div>
+
+<p><strong>Prerequisites:</strong> <a href="04_far_kv_cache.html">Exercise 1</a> (basic transformer). Familiarity with the <a href="https://arxiv.org/abs/2403.03206">Scaling Rectified Flow Transformers</a> paper is helpful but not required. Reference implementation: <a href="https://github.com/wendlerc/mnist">wendlerc/mnist</a>.</p>
+
+<h2>Setup</h2>
+
+<pre><code class="language-python">import torch
+import torch as t
+from torch import nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+from datasets import load_dataset
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+</code></pre>
+
+<h2>Part A: Patchifying Images</h2>
+
+<p>Vision transformers don't process raw pixels. Instead, they split images into non-overlapping patches and project each patch into an embedding vector. A 28&times;28 MNIST image with patch size 4 becomes a sequence of \((28/4)^2 = 49\) tokens (we'll pad to 32&times;32 first, giving \((32/4)^2 = 64\) tokens, but using the raw 28&times;28 with a strided convolution that handles the alignment is cleaner&mdash;we'll use <code>padding=2</code> to make it work with patch_size=4, yielding \(7 \times 7 = 49\) tokens).</p>
+
+<!-- ==================== EXERCISE 1 ==================== -->
+<div class="exercise">
+<h3>Exercise 1 &mdash; Implement Patch (Image &rarr; Tokens)</h3>
+<p class="exercise-meta">Difficulty: &#x1f534;&#x1f534;&#x1f534;&#x2b55;&#x2b55; &nbsp;|&nbsp; Importance: &#x1f535;&#x1f535;&#x1f535;&#x1f535;&#x1f535; &nbsp;|&nbsp; ~15 min</p>
+
+<p>Convert an image of shape <code>(batch, channels, height, width)</code> into a sequence of patch embeddings of shape <code>(batch, n_patches, d)</code>. Use a 2D convolution with <code>stride=patch_size</code> to extract and embed patches in one operation.</p>
+
+<pre><code class="language-python">class Patch(nn.Module):
+    """Convert images to patch token sequences.
+
+    A Conv2d with stride=patch_size extracts one patch per spatial position.
+    The output channels of the conv become the embedding dimension.
+    """
+    def __init__(self, patch_size=4, in_channels=1, d=32):
+        super().__init__()
+        self.d = d
+        self.patch_size = patch_size
+        # YOUR CODE HERE
+        # Create a Conv2d that maps (batch, in_channels, H, W)
+        # to (batch, d, H//patch_size, W//patch_size)
+        # Use kernel_size=5, padding=2 to handle non-divisible sizes
+
+    def forward(self, x):
+        """
+        Args:
+            x: (batch, channels, height, width) image tensor
+        Returns:
+            (batch, n_patches, d) patch embeddings
+        """
+        # YOUR CODE HERE
+        # 1. Apply the convolution
+        # 2. Reshape from (batch, d, h', w') to (batch, h'*w', d)
+        pass
+</code></pre>
+
+<p>Test it:</p>
+<pre><code class="language-python">patch = Patch(patch_size=4, in_channels=1, d=32)
+x = t.randn(2, 1, 28, 28)
+tokens = patch(x)
+assert tokens.shape == (2, 49, 32), f"Expected (2, 49, 32), got {tokens.shape}"
+print(f"Image {x.shape} -> Tokens {tokens.shape}")
+</code></pre>
+
+<details>
+<summary>Solution</summary>
+<pre><code class="language-python">class Patch(nn.Module):
+    def __init__(self, patch_size=4, in_channels=1, d=32):
+        super().__init__()
+        self.d = d
+        self.patch_size = patch_size
+        self.conv = nn.Conv2d(in_channels, d, kernel_size=5, padding=2, stride=patch_size)
+
+    def forward(self, x):
+        b, c, h, w = x.shape
+        x = self.conv(x)                           # (b, d, h//ps, w//ps)
+        x = x.permute(0, 2, 3, 1)                  # (b, h//ps, w//ps, d)
+        x = x.reshape(b, -1, self.d)               # (b, n_patches, d)
+        return x
+</code></pre>
+</details>
+</div>
+
+<!-- ==================== EXERCISE 2 ==================== -->
+<div class="exercise">
+<h3>Exercise 2 &mdash; Implement UnPatch (Tokens &rarr; Image)</h3>
+<p class="exercise-meta">Difficulty: &#x1f534;&#x1f534;&#x1f534;&#x2b55;&#x2b55; &nbsp;|&nbsp; Importance: &#x1f535;&#x1f535;&#x1f535;&#x1f535;&#x1f535; &nbsp;|&nbsp; ~15 min</p>
+
+<p>The inverse operation: convert a sequence of token embeddings back into an image. Each token is linearly projected to <code>patch_size^2 * out_channels</code> values, then reshaped back to spatial form.</p>
+
+<pre><code class="language-python">class UnPatch(nn.Module):
+    """Convert patch token sequences back to images."""
+    def __init__(self, patch_size=4, d=32, out_channels=1):
+        super().__init__()
+        self.out_channels = out_channels
+        self.patch_size = patch_size
+        # YOUR CODE HERE
+        # Linear layer: d -> patch_size^2 * out_channels
+
+    def forward(self, x):
+        """
+        Args:
+            x: (batch, n_patches, d) patch embeddings
+        Returns:
+            (batch, out_channels, height, width) reconstructed image
+        """
+        # YOUR CODE HERE
+        # 1. Linear projection to get pixel values per patch
+        # 2. Reshape from (b, n_patches, ps*ps*c) to spatial form
+        #    - first reshape to (b, h_patches, w_patches, c, ps, ps)
+        #    - then permute and reshape to (b, c, H, W)
+        pass
+</code></pre>
+
+<p>Test the round-trip (note: this won't reconstruct the image perfectly since Patch uses a learned conv, but the shapes should be correct):</p>
+<pre><code class="language-python">unpatch = UnPatch(patch_size=4, d=32, out_channels=1)
+reconstructed = unpatch(tokens)
+assert reconstructed.shape == (2, 1, 28, 28), f"Expected (2, 1, 28, 28), got {reconstructed.shape}"
+print(f"Tokens {tokens.shape} -> Image {reconstructed.shape}")
+</code></pre>
+
+<details>
+<summary>Hint</summary>
+<p>The tricky part is the reshape. After the linear layer, each token has <code>ps*ps*c</code> values. You need to arrange these into a spatial grid. Think of it as: <code>(b, h_p, w_p, c, ps, ps)</code> &rarr; permute to <code>(b, c, h_p, ps, w_p, ps)</code> &rarr; reshape to <code>(b, c, h_p*ps, w_p*ps)</code>. To get <code>h_p</code> and <code>w_p</code>, note that <code>n_patches = h_p * w_p</code> and we assume square images, so <code>h_p = w_p = sqrt(n_patches)</code>.</p>
+</details>
+
+<details>
+<summary>Solution</summary>
+<pre><code class="language-python">class UnPatch(nn.Module):
+    def __init__(self, patch_size=4, d=32, out_channels=1):
+        super().__init__()
+        self.out_channels = out_channels
+        self.patch_size = patch_size
+        self.up = nn.Linear(d, patch_size ** 2 * out_channels)
+
+    def forward(self, x):
+        b, s, d = x.shape
+        x = self.up(x)                                              # (b, s, ps*ps*c)
+        w = int(s ** 0.5)
+        h = w
+        ps = self.patch_size
+        c = self.out_channels
+        x = x.reshape(b, h, w, c, ps, ps)
+        x = x.permute(0, 3, 1, 4, 2, 5)                            # (b, c, h, ps, w, ps)
+        x = x.reshape(b, c, h * ps, w * ps)                        # (b, c, H, W)
+        return x
+</code></pre>
+</details>
+</div>
+
+<h2>Part B: Transformer Building Blocks</h2>
+
+<p>Now we build the transformer blocks that will process our patch sequences. The key difference from a standard transformer is <strong>adaptive layer normalization (AdaLN)</strong>: instead of fixed normalization, we modulate the normalized activations using the conditioning signal (timestep + class label). This is how the model knows <em>what</em> to generate and <em>how much noise</em> is in the input.</p>
+
+<!-- ==================== EXERCISE 3 ==================== -->
+<div class="exercise">
+<h3>Exercise 3 &mdash; Implement RMSNorm</h3>
+<p class="exercise-meta">Difficulty: &#x1f534;&#x2b55;&#x2b55;&#x2b55;&#x2b55; &nbsp;|&nbsp; Importance: &#x1f535;&#x1f535;&#x1f535;&#x2b55;&#x2b55; &nbsp;|&nbsp; ~5 min</p>
+
+<p>Root Mean Square normalization&mdash;like LayerNorm but without centering. Simpler, slightly faster, and used in most modern architectures.</p>
+
+<p>$$\text{RMSNorm}(x) = \frac{x}{\text{RMS}(x) + \epsilon} \cdot \gamma, \quad \text{RMS}(x) = \sqrt{\frac{1}{d}\sum_{i=1}^d x_i^2}$$</p>
+
+<pre><code class="language-python">class RMSNorm(nn.Module):
+    def __init__(self, d=32, eps=1e-6):
+        super().__init__()
+        # YOUR CODE HERE
+
+    def forward(self, x):
+        # YOUR CODE HERE
+        pass
+</code></pre>
+
+<details>
+<summary>Solution</summary>
+<pre><code class="language-python">class RMSNorm(nn.Module):
+    def __init__(self, d=32, eps=1e-6):
+        super().__init__()
+        self.scale = nn.Parameter(t.ones((1, 1, d)))
+        self.eps = eps
+
+    def forward(self, x):
+        rms = (x.pow(2).mean(dim=-1, keepdim=True)).sqrt() + self.eps
+        return x / rms * self.scale
+</code></pre>
+</details>
+</div>
+
+<!-- ==================== EXERCISE 4 ==================== -->
+<div class="exercise">
+<h3>Exercise 4 &mdash; Implement Attention with QK-Norm</h3>
+<p class="exercise-meta">Difficulty: &#x1f534;&#x1f534;&#x1f534;&#x2b55;&#x2b55; &nbsp;|&nbsp; Importance: &#x1f535;&#x1f535;&#x1f535;&#x1f535;&#x1f535; &nbsp;|&nbsp; ~20 min</p>
+
+<p>Implement multi-head attention. A small but important detail: modern DiT architectures apply RMSNorm to the queries and keys <em>separately</em> before computing the dot product. This stabilizes training.</p>
+
+<p>Note: unlike in a language model, we do <strong>not</strong> use a causal mask here. Each patch should attend to all other patches (bidirectional attention). We're denoising the whole image at once, not generating it left-to-right.</p>
+
+<pre><code class="language-python">class Attention(nn.Module):
+    def __init__(self, d=32, n_head=4):
+        super().__init__()
+        self.n_head = n_head
+        self.d = d
+        self.d_head = d // n_head
+        # YOUR CODE HERE
+        # - QKV projection (single linear, 3*d output)
+        # - Output projection
+        # - RMSNorm for queries and keys (applied per-head, so dim = d_head)
+
+    def forward(self, x):
+        """
+        Args:
+            x: (batch, seq, d)
+        Returns:
+            (batch, seq, d)
+        """
+        # YOUR CODE HERE
+        # 1. Project to Q, K, V
+        # 2. Reshape to (batch, seq, n_head, d_head)
+        # 3. Apply QK-norm
+        # 4. Compute attention (no causal mask!)
+        # 5. Apply output projection
+        pass
+</code></pre>
+
+<details>
+<summary>Hint</summary>
+<p>The RMSNorm for Q and K operates on the <code>d_head</code> dimension. After reshaping Q, K to <code>(batch, seq, n_head, d_head)</code>, the norm is applied to the last dimension. The RMSNorm module works because it normalizes over the last dimension by default.</p>
+</details>
+
+<details>
+<summary>Solution</summary>
+<pre><code class="language-python">class Attention(nn.Module):
+    def __init__(self, d=32, n_head=4):
+        super().__init__()
+        self.n_head = n_head
+        self.d = d
+        self.d_head = d // n_head
+        self.QKV = nn.Linear(d, 3 * d, bias=False)
+        self.O = nn.Linear(d, d, bias=False)
+        self.normq = RMSNorm(self.d_head)
+        self.normk = RMSNorm(self.d_head)
+
+    def forward(self, x):
+        b, s, d = x.shape
+        q, k, v = self.QKV(x).chunk(3, dim=-1)
+        q = q.reshape(b, s, self.n_head, self.d_head)
+        k = k.reshape(b, s, self.n_head, self.d_head)
+        v = v.reshape(b, s, self.n_head, self.d_head)
+        q = self.normq(q)
+        k = self.normk(k)
+        # (b, n_head, s, d_head)
+        attn = q.permute(0, 2, 1, 3) @ k.permute(0, 2, 3, 1)
+        attn = attn.softmax(dim=-1)
+        z = attn @ v.permute(0, 2, 1, 3)
+        z = z.permute(0, 2, 1, 3).reshape(b, s, self.d)
+        return self.O(z)
+</code></pre>
+</details>
+</div>
+
+<!-- ==================== EXERCISE 5 ==================== -->
+<div class="exercise">
+<h3>Exercise 5 &mdash; Implement Gated MLP</h3>
+<p class="exercise-meta">Difficulty: &#x1f534;&#x1f534;&#x2b55;&#x2b55;&#x2b55; &nbsp;|&nbsp; Importance: &#x1f535;&#x1f535;&#x1f535;&#x2b55;&#x2b55; &nbsp;|&nbsp; ~10 min</p>
+
+<p>The feedforward network uses a gated architecture: <code>output = down(up(x) * SiLU(gate(x)))</code>. The gating mechanism allows the network to selectively pass information.</p>
+
+<pre><code class="language-python">class MLP(nn.Module):
+    def __init__(self, d=32, exp=2):
+        super().__init__()
+        # YOUR CODE HERE
+
+    def forward(self, x):
+        # YOUR CODE HERE
+        pass
+</code></pre>
+
+<details>
+<summary>Solution</summary>
+<pre><code class="language-python">class MLP(nn.Module):
+    def __init__(self, d=32, exp=2):
+        super().__init__()
+        self.up = nn.Linear(d, exp * d, bias=False)
+        self.gate = nn.Linear(d, exp * d, bias=False)
+        self.down = nn.Linear(exp * d, d, bias=False)
+        self.act = nn.SiLU()
+
+    def forward(self, x):
+        return self.down(self.up(x) * self.act(self.gate(x)))
+</code></pre>
+</details>
+</div>
+
+<!-- ==================== EXERCISE 6 ==================== -->
+<div class="exercise">
+<h3>Exercise 6 &mdash; Implement Sinusoidal Embeddings for Timesteps</h3>
+<p class="exercise-meta">Difficulty: &#x1f534;&#x1f534;&#x2b55;&#x2b55;&#x2b55; &nbsp;|&nbsp; Importance: &#x1f535;&#x1f535;&#x1f535;&#x1f535;&#x2b55; &nbsp;|&nbsp; ~10 min</p>
+
+<p>We need to encode the noise level (timestep) as a vector. We use sinusoidal embeddings, similar to positional encodings in the original transformer. These provide a smooth, continuous embedding for integer indices.</p>
+
+<p>For index \(n\) and dimension \(i\):</p>
+<p>$$\text{emb}(n, 2i) = \sin(n \cdot C^{-i/(d/2)}), \quad \text{emb}(n, 2i+1) = \cos(n \cdot C^{-i/(d/2)})$$</p>
+
+<p>where \(C\) is a base frequency (typically 500 or 10000).</p>
+
+<pre><code class="language-python">class NumEmbedding(nn.Module):
+    """Sinusoidal embeddings for integer values (used for timesteps)."""
+    def __init__(self, n_max, d=32, C=500):
+        super().__init__()
+        # YOUR CODE HERE
+        # Precompute the embedding table of shape (n_max, d) and register as buffer
+
+    def forward(self, x):
+        """
+        Args:
+            x: integer tensor of any shape
+        Returns:
+            embedding tensor with last dim = d
+        """
+        # YOUR CODE HERE
+        pass
+</code></pre>
+
+<p>Test it:</p>
+<pre><code class="language-python">emb = NumEmbedding(1000, d=32)
+out = emb(t.tensor([0, 100, 500, 999]))
+assert out.shape == (4, 32)
+# Check that different timesteps produce different embeddings
+assert not t.allclose(out[0], out[1])
+print("NumEmbedding works!")
+</code></pre>
+
+<details>
+<summary>Solution</summary>
+<pre><code class="language-python">class NumEmbedding(nn.Module):
+    def __init__(self, n_max, d=32, C=500):
+        super().__init__()
+        thetas = C ** (-t.arange(0, d // 2) / (d // 2))
+        thetas = t.arange(0, n_max)[:, None].float() @ thetas[None, :]
+        sins = t.sin(thetas)
+        coss = t.cos(thetas)
+        self.register_buffer("E", t.cat([sins, coss], dim=1))
+
+    def forward(self, x):
+        return self.E[x]
+</code></pre>
+</details>
+</div>
+
+<!-- ==================== EXERCISE 7 ==================== -->
+<div class="exercise">
+<h3>Exercise 7 &mdash; Implement the DiT Block with AdaLN Modulation</h3>
+<p class="exercise-meta">Difficulty: &#x1f534;&#x1f534;&#x1f534;&#x1f534;&#x2b55; &nbsp;|&nbsp; Importance: &#x1f535;&#x1f535;&#x1f535;&#x1f535;&#x1f535; &nbsp;|&nbsp; ~25 min</p>
+
+<p>This is the key architectural innovation. Instead of standard <code>norm &rarr; attention &rarr; residual</code>, the DiT block uses <strong>adaptive instance normalization</strong>: the conditioning signal (timestep + class) produces 6 modulation parameters per block &mdash; scale, bias, and gate for both the attention and MLP sub-layers.</p>
+
+<p>The forward pass for each sub-layer is:</p>
+
+<pre><code>x_norm = RMSNorm(x)
+x_modulated = x_norm * (1 + scale) + bias     # AdaLN
+x_out = sublayer(x_modulated) * gate           # gating
+x = x + x_out                                  # residual
+</code></pre>
+
+<p>The conditioning vector \(c\) is projected to produce all 6 parameters: <code>(scale1, bias1, gate1, scale2, bias2, gate2) = Linear(c).chunk(6)</code></p>
+
+<pre><code class="language-python">class DiTBlock(nn.Module):
+    def __init__(self, d=32, n_head=4, exp=2):
+        super().__init__()
+        # YOUR CODE HERE
+        # - Two RMSNorm layers (one for attn, one for MLP)
+        # - Attention and MLP modules
+        # - Linear layer mapping d -> 6*d for modulation parameters
+
+    def forward(self, x, c):
+        """
+        Args:
+            x: (batch, seq, d) token embeddings
+            c: (batch, d) conditioning vector (timestep + class embedding)
+        Returns:
+            (batch, seq, d) output
+        """
+        # YOUR CODE HERE
+        # 1. Get 6 modulation params from c: scale1, bias1, gate1, scale2, bias2, gate2
+        # 2. Apply modulated attention: norm -> scale & bias -> attn -> gate -> residual
+        # 3. Apply modulated MLP: norm -> scale & bias -> mlp -> gate -> residual
+        # Note: c is (batch, d) but x is (batch, seq, d), so unsqueeze c for broadcasting
+        pass
+</code></pre>
+
+<details>
+<summary>Hint</summary>
+<p>The modulation parameters are per-sample, not per-token, so <code>c</code> is <code>(batch, d)</code>. When you multiply or add them to <code>x</code> which is <code>(batch, seq, d)</code>, you need to unsqueeze: <code>scale[:, None, :]</code>.</p>
+</details>
+
+<details>
+<summary>Solution</summary>
+<pre><code class="language-python">class DiTBlock(nn.Module):
+    def __init__(self, d=32, n_head=4, exp=2):
+        super().__init__()
+        self.norm1 = RMSNorm(d)
+        self.attn = Attention(d, n_head)
+        self.norm2 = RMSNorm(d)
+        self.mlp = MLP(d, exp)
+        self.modulate = nn.Linear(d, 6 * d)
+
+    def forward(self, x, c):
+        scale1, bias1, gate1, scale2, bias2, gate2 = self.modulate(c).chunk(6, dim=-1)
+
+        residual = x
+        x = self.norm1(x) * (1 + scale1[:, None, :]) + bias1[:, None, :]
+        x = self.attn(x) * gate1[:, None, :]
+        x = residual + x
+
+        residual = x
+        x = self.norm2(x) * (1 + scale2[:, None, :]) + bias2[:, None, :]
+        x = self.mlp(x) * gate2[:, None, :]
+        x = residual + x
+        return x
+</code></pre>
+</details>
+</div>
+
+<!-- ==================== EXERCISE 8 ==================== -->
+<div class="exercise">
+<h3>Exercise 8 &mdash; Assemble the Full DiT Model</h3>
+<p class="exercise-meta">Difficulty: &#x1f534;&#x1f534;&#x1f534;&#x2b55;&#x2b55; &nbsp;|&nbsp; Importance: &#x1f535;&#x1f535;&#x1f535;&#x1f535;&#x1f535; &nbsp;|&nbsp; ~20 min</p>
+
+<p>Put all the pieces together into a complete DiT model. The model:</p>
+<ol>
+  <li>Patchifies the input image into tokens</li>
+  <li>Adds learnable positional embeddings</li>
+  <li>Combines timestep embedding + class embedding into a conditioning vector</li>
+  <li>Runs through \(N\) DiT blocks</li>
+  <li>Applies final modulated normalization</li>
+  <li>Unpatchifies back to image space</li>
+</ol>
+
+<p>The model predicts the <strong>velocity field</strong> \(v\) &mdash; we'll explain what this means in the next section.</p>
+
+<pre><code class="language-python">class DiT(nn.Module):
+    def __init__(self, h=28, w=28, n_classes=10, in_channels=1,
+                 patch_size=4, n_blocks=4, d=32, n_head=4, exp=2, T=1000):
+        super().__init__()
+        self.T = T
+        # YOUR CODE HERE
+        # - Patch module
+        # - Learnable positional embedding: (1, n_patches, d)
+        # - NumEmbedding for timesteps (n_max=T)
+        # - nn.Embedding for class labels (n_classes entries)
+        # - SiLU activation for combining embeddings
+        # - n_blocks DiTBlocks
+        # - Final RMSNorm + modulation (Linear d -> 2*d for final scale, bias)
+        # - UnPatch module
+
+    def forward(self, x, c, ts):
+        """
+        Args:
+            x: (batch, channels, H, W) noisy image
+            c: (batch,) integer class labels
+            ts: (batch,) float timesteps in [0, 1]
+        Returns:
+            (batch, channels, H, W) predicted velocity
+        """
+        # YOUR CODE HERE
+        # 1. Convert float timestep to int: ts_int = min(ts * T, T-1)
+        # 2. Combine embeddings: cond = SiLU(timestep_emb + class_emb)
+        # 3. Patchify input and add positional embedding
+        # 4. Run through DiT blocks
+        # 5. Final modulated norm
+        # 6. Unpatchify and return
+        pass
+
+    @property
+    def device(self):
+        return next(self.parameters()).device
+
+    @property
+    def dtype(self):
+        return next(self.parameters()).dtype
+</code></pre>
+
+<p>Test it:</p>
+<pre><code class="language-python">model = DiT(h=28, w=28, n_classes=11, d=32, n_head=4, n_blocks=4).to(device)
+x = t.randn(2, 1, 28, 28, device=device)
+c = t.tensor([3, 7], device=device)
+ts = t.tensor([0.5, 0.8], device=device)
+v = model(x, c, ts)
+assert v.shape == (2, 1, 28, 28), f"Expected (2, 1, 28, 28), got {v.shape}"
+n_params = sum(p.numel() for p in model.parameters())
+print(f"DiT output shape: {v.shape}, Parameters: {n_params:,}")
+</code></pre>
+
+<details>
+<summary>Solution</summary>
+<pre><code class="language-python">class DiT(nn.Module):
+    def __init__(self, h=28, w=28, n_classes=10, in_channels=1,
+                 patch_size=4, n_blocks=4, d=32, n_head=4, exp=2, T=1000):
+        super().__init__()
+        self.T = T
+        self.patch = Patch(patch_size, in_channels, d)
+        self.n_seq = (h // patch_size) * (w // patch_size)
+        self.pe = nn.Parameter(t.randn(1, self.n_seq, d) * d ** -0.5)
+        self.te = NumEmbedding(T, d)
+        self.ce = nn.Embedding(n_classes, d)
+        self.act = nn.SiLU()
+        self.blocks = nn.ModuleList([DiTBlock(d, n_head, exp) for _ in range(n_blocks)])
+        self.norm = RMSNorm(d)
+        self.modulate = nn.Linear(d, 2 * d)
+        self.unpatch = UnPatch(patch_size, d, in_channels)
+
+    def forward(self, x, c, ts):
+        ts_int = t.minimum((ts * self.T).to(t.int64), t.tensor(self.T - 1, device=ts.device))
+        cond = self.act(self.te(ts_int) + self.ce(c))
+        x = self.patch(x) + self.pe
+        for block in self.blocks:
+            x = block(x, cond)
+        scale, bias = self.modulate(cond).chunk(2, dim=-1)
+        x = self.norm(x) * (1 + scale[:, None, :]) + bias[:, None, :]
+        x = self.unpatch(x)
+        return x
+
+    @property
+    def device(self):
+        return self.pe.device
+
+    @property
+    def dtype(self):
+        return self.pe.dtype
+</code></pre>
+</details>
+</div>
+
+<h2>Part C: Rectified Flow Matching</h2>
+
+<p>Now we get to the generative modeling objective. <strong>Rectified flow matching</strong> is elegant in its simplicity.</p>
+
+<p>The idea: we define a straight-line path from each data point \(x\) to a random noise sample \(z \sim \mathcal{N}(0, I)\):</p>
+
+<p>$$x_t = (1-t) \cdot x + t \cdot z$$</p>
+
+<p>where \(t \in [0, 1]\). At \(t=0\), we have the clean data; at \(t=1\), we have pure noise.</p>
+
+<p>The <strong>velocity</strong> along this path is:</p>
+<p>$$v = \frac{dx_t}{dt} = z - x$$</p>
+
+<p>We train the model to predict this velocity given \(x_t\) and \(t\). At inference time, we start from noise (\(t=1\)) and integrate backwards to \(t=0\) using Euler steps.</p>
+
+<!-- ==================== EXERCISE 9 ==================== -->
+<div class="exercise">
+<h3>Exercise 9 &mdash; Implement the Flow Matching Training Step</h3>
+<p class="exercise-meta">Difficulty: &#x1f534;&#x1f534;&#x1f534;&#x2b55;&#x2b55; &nbsp;|&nbsp; Importance: &#x1f535;&#x1f535;&#x1f535;&#x1f535;&#x1f535; &nbsp;|&nbsp; ~15 min</p>
+
+<p>Implement a single training step. Given a batch of clean images and their labels:</p>
+<ol>
+  <li>Sample random timesteps \(t \sim U(0, 1)\)</li>
+  <li>Sample random noise \(z \sim \mathcal{N}(0, I)\)</li>
+  <li>Compute the noisy image: \(x_t = (1 - t) \cdot x + t \cdot z\). Equivalently: \(x_t = x + t \cdot (z - x) = x - t \cdot v_{\text{true}}\) with \(v_{\text{true}} = x - z\)</li>
+  <li>Predict the velocity: \(\hat{v} = \text{model}(x_t, c, t)\)</li>
+  <li>Compute MSE loss: \(\mathcal{L} = \| \hat{v} - v_{\text{true}} \|^2\)</li>
+</ol>
+
+<div class="note">
+<strong>Sign convention note:</strong> In our implementation, following the reference code, we define \(v_{\text{true}} = x - z\) (pointing from noise to data). The noisy image is then \(x_t = x - t \cdot v_{\text{true}}\). During sampling, we'll integrate from \(t=1\) (noise) to \(t=0\) (data) by subtracting velocity steps.
+</div>
+
+<pre><code class="language-python">def flow_matching_loss(model, x, c):
+    """Compute the rectified flow matching loss.
+
+    Args:
+        model: DiT model
+        x: (batch, channels, H, W) clean images
+        c: (batch,) class labels
+
+    Returns:
+        scalar loss
+    """
+    # YOUR CODE HERE
+    pass
+</code></pre>
+
+<details>
+<summary>Solution</summary>
+<pre><code class="language-python">def flow_matching_loss(model, x, c):
+    batch_size = x.shape[0]
+    ts = t.rand(batch_size, device=x.device, dtype=x.dtype)
+    z = t.randn_like(x)
+    v_true = x - z                                       # velocity: noise -> data
+    x_t = x - ts[:, None, None, None] * v_true           # noisy image
+    v_pred = model(x_t, c, ts)
+    loss = F.mse_loss(v_pred, v_true)
+    return loss
+</code></pre>
+</details>
+</div>
+
+<!-- ==================== EXERCISE 10 ==================== -->
+<div class="exercise">
+<h3>Exercise 10 &mdash; Implement Euler Sampling</h3>
+<p class="exercise-meta">Difficulty: &#x1f534;&#x1f534;&#x1f534;&#x2b55;&#x2b55; &nbsp;|&nbsp; Importance: &#x1f535;&#x1f535;&#x1f535;&#x1f535;&#x1f535; &nbsp;|&nbsp; ~15 min</p>
+
+<p>To generate an image, we start from pure noise and step from \(t=1\) to \(t=0\). At each step, the model predicts the velocity, and we take an Euler step:</p>
+
+<p>$$z_{i+1} = z_i + (t_i - t_{i+1}) \cdot \hat{v}(z_i, t_i)$$</p>
+
+<p>We also use the <strong>SD3 scheduler</strong> which remaps the timestep schedule for better sample quality: <code>ts = 3*ts / (2*ts + 1)</code>.</p>
+
+<pre><code class="language-python">@t.no_grad()
+def sample(model, z, y, n_steps=30, cfg=0):
+    """Generate images from noise using Euler integration.
+
+    Args:
+        model: trained DiT
+        z: (batch, channels, H, W) initial noise
+        y: (batch,) class labels
+        n_steps: number of Euler steps
+        cfg: classifier-free guidance strength (0 = no guidance)
+
+    Returns:
+        (batch, channels, H, W) generated images
+    """
+    # YOUR CODE HERE
+    # 1. Create n_steps+1 evenly spaced timesteps from 1 to 0
+    # 2. Apply SD3 schedule: ts = 3*ts / (2*ts + 1)
+    # 3. For each step:
+    #    a. Predict velocity at current timestep
+    #    b. If cfg > 0: also predict unconditional velocity (with y=0)
+    #       and blend: v = v_uncond + cfg * (v_cond - v_uncond)
+    #    c. Euler step: z = z + (ts[i] - ts[i+1]) * v_pred
+    # 4. Return z
+    pass
+</code></pre>
+
+<details>
+<summary>Hint</summary>
+<p>For the timestep at each step, create a tensor of shape <code>(batch,)</code> filled with the current timestep value: <code>ts[i] * t.ones(batch_size, ...)</code>.</p>
+</details>
+
+<details>
+<summary>Solution</summary>
+<pre><code class="language-python">@t.no_grad()
+def sample(model, z, y, n_steps=30, cfg=0):
+    ts = t.linspace(1, 0, n_steps + 1, device=z.device, dtype=z.dtype)
+    ts = 3 * ts / (2 * ts + 1)  # SD3 scheduler
+    for idx in range(n_steps):
+        t_batch = ts[idx] * t.ones(z.shape[0], dtype=z.dtype, device=z.device)
+        v_pred = model(z, y, t_batch)
+        if cfg > 0:
+            v_uncond = model(z, y * 0, t_batch)
+            v_pred = v_uncond + cfg * (v_pred - v_uncond)
+        z = z + (ts[idx] - ts[idx + 1]) * v_pred
+    return z
+</code></pre>
+</details>
+</div>
+
+<h2>Part D: Training on MNIST</h2>
+
+<!-- ==================== EXERCISE 11 ==================== -->
+<div class="exercise">
+<h3>Exercise 11 &mdash; Train the Unconditional Model</h3>
+<p class="exercise-meta">Difficulty: &#x1f534;&#x1f534;&#x1f534;&#x2b55;&#x2b55; &nbsp;|&nbsp; Importance: &#x1f535;&#x1f535;&#x1f535;&#x1f535;&#x1f535; &nbsp;|&nbsp; ~20 min (+ training time)</p>
+
+<p>Load MNIST and train the model. For the unconditional version, we ignore class labels (pass zeros). With a small model (\(d{=}32\), 4 blocks), training should converge in ~10 epochs on a single GPU.</p>
+
+<pre><code class="language-python"># Data loading
+dataset = load_dataset("ylecun/mnist", split="train")
+
+def collate_fn(batch):
+    images = t.stack([t.tensor(item['image']).float() for item in batch])
+    labels = t.stack([t.tensor(item['label']) for item in batch])
+    images = images.unsqueeze(1)  # Add channel dim: (batch, 1, 28, 28)
+    images = images / 127.5 - 1    # Normalize to [-1, 1]
+    return images, labels
+
+train_loader = DataLoader(dataset, batch_size=64, shuffle=True,
+                          collate_fn=collate_fn, num_workers=2)
+</code></pre>
+
+<p>Now write the training loop:</p>
+
+<pre><code class="language-python">model = DiT(h=28, w=28, n_classes=11, d=32, n_head=4, n_blocks=4).to(device)
+optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, betas=(0.9, 0.95))
+
+# YOUR CODE HERE
+# Write the training loop:
+# - 10 epochs
+# - For each batch: compute flow_matching_loss, backprop, clip gradients (max_norm=10), step
+# - Pass class label = 0 (unconditional) for all samples
+# - Print loss every 100 steps
+# - After each epoch, generate and display samples
+</code></pre>
+
+<details>
+<summary>Solution</summary>
+<pre><code class="language-python">model = DiT(h=28, w=28, n_classes=11, d=32, n_head=4, n_blocks=4).to(device)
+optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, betas=(0.9, 0.95))
+
+n_epochs = 10
+step = 0
+for epoch in range(n_epochs):
+    model.train()
+    epoch_loss = 0
+    for images, labels in tqdm(train_loader, desc=f"Epoch {epoch+1}"):
+        images = images.to(device)
+        c = t.zeros(images.shape[0], dtype=t.long, device=device)  # unconditional
+
+        loss = flow_matching_loss(model, images, c)
+        optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 10.0)
+        optimizer.step()
+
+        epoch_loss += loss.item()
+        step += 1
+
+    avg_loss = epoch_loss / len(train_loader)
+    print(f"Epoch {epoch+1}/{n_epochs} | Loss: {avg_loss:.4f}")
+
+    # Generate samples
+    model.eval()
+    z = t.randn(16, 1, 28, 28, device=device)
+    y = t.zeros(16, dtype=t.long, device=device)
+    samples = sample(model, z, y, n_steps=30)
+    samples = (samples.clamp(-1, 1) + 1) / 2  # to [0, 1]
+
+    fig, axes = plt.subplots(2, 8, figsize=(12, 3))
+    for i, ax in enumerate(axes.flat):
+        ax.imshow(samples[i, 0].cpu(), cmap='gray')
+        ax.axis('off')
+    plt.suptitle(f"Epoch {epoch+1}")
+    plt.tight_layout()
+    plt.show()
+</code></pre>
+</details>
+</div>
+
+<h2>Part E: Class-Conditional Generation &amp; Classifier-Free Guidance</h2>
+
+<p>Now we add class conditioning. The key trick for <strong>classifier-free guidance (CFG)</strong> is:</p>
+
+<ol>
+  <li><strong>During training:</strong> randomly drop the class label (replace with 0) some fraction of the time (e.g., 20%). This teaches the model to generate both conditionally and unconditionally.</li>
+  <li><strong>During inference:</strong> run the model twice&mdash;once with the class label, once without&mdash;and extrapolate:
+  $$v_{\text{guided}} = v_{\text{uncond}} + w \cdot (v_{\text{cond}} - v_{\text{uncond}})$$
+  where \(w > 1\) amplifies the class signal.</li>
+</ol>
+
+<!-- ==================== EXERCISE 12 ==================== -->
+<div class="exercise">
+<h3>Exercise 12 &mdash; Train Class-Conditional Model with CFG</h3>
+<p class="exercise-meta">Difficulty: &#x1f534;&#x1f534;&#x1f534;&#x2b55;&#x2b55; &nbsp;|&nbsp; Importance: &#x1f535;&#x1f535;&#x1f535;&#x1f535;&#x1f535; &nbsp;|&nbsp; ~15 min (+ training time)</p>
+
+<p>Modify the training loop to use actual class labels (shifted by 1, so label 0 is reserved for "unconditional") and apply 20% random dropout of the class label.</p>
+
+<pre><code class="language-python"># YOUR CODE HERE
+# Modify the training loop:
+# 1. Use actual class labels: c = labels + 1  (shift so 0 = unconditional)
+# 2. Apply 20% label dropout: randomly set some labels to 0
+#    mask = t.rand(batch_size) < 0.2
+#    c[mask] = 0
+# 3. Train for 10 epochs
+# 4. After training, sample with CFG:
+#    - For each class 1..10, generate samples with cfg=3
+#    - Display in a grid showing each digit class
+</code></pre>
+
+<details>
+<summary>Solution</summary>
+<pre><code class="language-python">model = DiT(h=28, w=28, n_classes=11, d=32, n_head=4, n_blocks=4).to(device)
+optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, betas=(0.9, 0.95))
+
+n_epochs = 10
+for epoch in range(n_epochs):
+    model.train()
+    epoch_loss = 0
+    for images, labels in tqdm(train_loader, desc=f"Epoch {epoch+1}"):
+        images = images.to(device)
+        labels = labels.to(device)
+
+        c = labels + 1  # shift: 0 reserved for unconditional
+        # 20% label dropout for CFG training
+        drop_mask = t.rand(c.shape[0], device=device) < 0.2
+        c[drop_mask] = 0
+
+        loss = flow_matching_loss(model, images, c)
+        optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 10.0)
+        optimizer.step()
+        epoch_loss += loss.item()
+
+    avg_loss = epoch_loss / len(train_loader)
+    print(f"Epoch {epoch+1}/{n_epochs} | Loss: {avg_loss:.4f}")
+
+# Generate class-conditional samples with CFG
+model.eval()
+fig, axes = plt.subplots(10, 8, figsize=(12, 15))
+for digit in range(10):
+    z = t.randn(8, 1, 28, 28, device=device)
+    y = t.full((8,), digit + 1, dtype=t.long, device=device)
+    imgs = sample(model, z, y, n_steps=30, cfg=3.0)
+    imgs = (imgs.clamp(-1, 1) + 1) / 2
+    for j in range(8):
+        axes[digit, j].imshow(imgs[j, 0].cpu(), cmap='gray')
+        axes[digit, j].axis('off')
+    axes[digit, 0].set_ylabel(str(digit), fontsize=14, rotation=0, labelpad=20)
+plt.suptitle("Class-Conditional Samples (CFG=3)", fontsize=16)
+plt.tight_layout()
+plt.show()
+</code></pre>
+</details>
+</div>
+
+<div class="note">
+<strong>What to expect:</strong> After 10 epochs, you should see recognizable digits. With CFG strength of 3, the digits should be clear and well-formed. Try varying the CFG strength: <code>cfg=0</code> (unconditional, blurry), <code>cfg=1</code> (mild guidance), <code>cfg=3</code> (strong guidance, sharp), <code>cfg=10</code> (over-saturated).
+</div>
+
+<h2>Summary</h2>
+
+<p>In this exercise you've built a complete flow-matching image generator from scratch:</p>
+<ul>
+  <li><strong>Patchify/UnPatchify:</strong> Converting images to token sequences for transformer processing</li>
+  <li><strong>DiT Architecture:</strong> Transformer blocks with AdaLN modulation for conditioning</li>
+  <li><strong>Rectified Flow Matching:</strong> Training objective that learns to predict velocity fields along straight paths between data and noise</li>
+  <li><strong>Euler Sampling:</strong> Generating images by integrating the learned velocity field from noise to data</li>
+  <li><strong>Classifier-Free Guidance:</strong> Amplifying class conditioning at inference time for sharper results</li>
+</ul>
+
+<p>In <a href="03_far_pong.html">Exercise 3</a>, we'll extend this to video generation&mdash;turning the image model into a frame-autoregressive world model for Pong.</p>
+
+<p><a class="nav-link" href="04_far_kv_cache.html">&larr; Previous: Exercise 1</a> &nbsp; <a class="nav-link" href="03_far_pong.html">Next: Exercise 3 &rarr;</a></p>
+
+</body>
+</html>
