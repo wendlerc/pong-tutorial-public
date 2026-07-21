@@ -21,7 +21,8 @@ Then open any exercise notebook and select the **"pong-tutorial (.venv)"** kerne
 | 1 | [Rectified Flow Matching Basics](exercises/part1_flow_matching_basics/exercises.ipynb) | Flow matching on two moons: velocity prediction, training, sampling, schedules, CFG |
 | 2 | [Flow Matching on MNIST](exercises/part2_flow_matching_mnist/exercises.ipynb) | Build a DiT from scratch: patchify, flow matching, training, sampling, CFG |
 | 3 | [Frame-Autoregressive Pong](exercises/part3_far_pong/exercises.ipynb) | Extend to video with causal attention, action conditioning, diffusion forcing |
-| 4 | [KV Caching for FAR Inference](exercises/part4_far_kv_cache/exercises.ipynb) | KV caching for efficient video generation |
+| 4 | [KV Caching for FAR Inference](exercises/part4_far_kv_cache/exercises.ipynb) | KV caching for efficient video generation <-- AI slop, needs cleanup, volunteers welcome.
+ |
 
 Each exercise directory contains:
 - `exercises.ipynb` — notebook with stub functions (`# YOUR CODE HERE`)
