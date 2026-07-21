@@ -38,5 +38,5 @@ exercises/
   part1_flow_matching_basics/          # Two moons with MLP 
   part2_flow_matching_mnist/           # DiT on MNIST 
   part3_far_pong/                      # FAR video model + pong_data.py
-  part4_far_kv_cache/                   # KV-cache for video 
+  part4_far_kv_cache/                   # KV-cache for video <-- AI slop, needs cleanup, volunteers welcome.
 ```
